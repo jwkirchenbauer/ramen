@@ -1,5 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
+from tokenize import Token
 import torch
 import argparse
 import torch.nn as nn
@@ -15,6 +16,8 @@ parser.add_argument('--prob', default='', help='word translation probability')
 parser.add_argument('--tgt_model', default='', help='save the target model')
 params = parser.parse_args()
 print(params)
+
+import random
 
 if 'roberta' in params.src_model:
     CLS_TOKEN, CLS_INDEX = '<s>', 0
@@ -48,6 +51,11 @@ def guess(src_embs, src_bias, tgt_tokenizer, src_tokenizer, prob=None):
     num_tgt = tgt_tokenizer.get_vocab_size()
 
     # init with zero
+    # seed = 1823 # frozen for debugging
+    # random.seed(seed)
+    # np.random.seed(seed)
+    # torch.manual_seed(seed)
+
     tgt_embs = src_embs.new_empty(num_tgt, emb_dim)
     tgt_bias = src_bias.new_zeros(num_tgt)
     nn.init.normal_(tgt_embs, mean=0, std=emb_dim ** -0.5)
@@ -66,7 +74,9 @@ def guess(src_embs, src_bias, tgt_tokenizer, src_tokenizer, prob=None):
     num_src_per_tgt = np.array([len(x) for x in prob.values()]).mean()
     print(f'| # aligned src / tgt: {num_src_per_tgt:.5}')
 
-    for t, ws in prob.items():
+    from tqdm import tqdm
+    for t, ws in tqdm(prob.items(), total=len(prob.keys()),
+                                    desc="Iterating over transition matrix"):
         if not tgt_tokenizer.token_to_id(t): continue
 
         px, ix = [], []
@@ -131,8 +141,107 @@ def init_tgt(params):
         model[MAP['output_bias']].norm().item()))
 
     # save the model
-    torch.save(model, params.tgt_model)
+    # torch.save(model, params.tgt_model)
+    return model
+
+
+from transformers import AutoModelForMaskedLM
+from tokenizers import Tokenizer
+
+def tgt_src_matching(prob: dict,
+                     src_embs: nn.Parameter,
+                     src_bias: nn.Parameter,
+                     src_tokenizer: Tokenizer,
+                     tgt_tokenizer: Tokenizer):
+
+    tgt_embs, tgt_bias = guess(src_embs, src_bias, tgt_tokenizer, src_tokenizer, prob=prob)
+
+    return tgt_embs, tgt_bias
+
+
+def german_english_rcsls_align(tgt_model, percent_to_match=None):
+
+    # paths and spec for the model we're using as the source
+    artifact_path = "/cmlscratch/jkirchen/vocab-root/ramen/data/artifacts"
+    src_model_name_or_path="bert-base-cased"
+    # tgt_model_name_or_path="dbmdz/bert-base-german-cased" # this is passed in under our API
+
+    # These three paths are the primary spec/output for the 
+    # manual alignment gen steps that have to be run using other scripts
+    trans_prob_path=f"{artifact_path}/probs/probs.mono.en-de.pth"
+    src_model_vocab_path = f"{artifact_path}/en/tokenizer/en-vocab.txt"
+    tgt_model_vocab_path = f"{artifact_path}/de/tokenizer/de-vocab.txt"
+
+    # can probably intantiate the correct tokenizers directly
+    # tokenizer = AutoTokenizer.from_pretrained("bert-base-cased", use_fast=True)
+    # etc, but for now implementing a near copy of the orig command line function
+    # and thus loading them from the exact vocab used to produce the trans matrix
+
+    prob = None
+    if trans_prob_path:
+        print(' | load word translation probs!')
+        prob = torch.load(trans_prob_path)
+
+    print(f'| load English pre-trained model: {src_model_name_or_path}')
+    src_model = AutoModelForMaskedLM.from_pretrained(src_model_name_or_path)
+
+    # get English word-embeddings and bias
+    src_embs = src_model.bert.embeddings.word_embeddings.weight
+    src_bias = src_model.cls.predictions.bias
+
+    if 'roberta' in src_model_name_or_path:
+        raise NotImplementedError("Haven't handled the roberta BPE src/tgt cases")
+        assert params.src_merge, "merge file should be provided!"
+        src_tokenizer = RobertaTokenizer(src_model_vocab, params.src_merge)
+    else:
+        # note that we do not lowercase here
+        src_tokenizer = BertTokenizer(src_model_vocab_path, do_lower_case=False)
+
+    
+    # initialize target tokenizer, we always use BertWordPieceTokenizer for the target language
+    tgt_tokenizer = BertWordPieceTokenizer(
+        tgt_model_vocab_path,
+        unk_token=UNK_TOKEN,
+        sep_token=SEP_TOKEN,
+        cls_token=CLS_TOKEN,
+        pad_token=PAD_TOKEN,
+        mask_token=MASK_TOKEN,
+        lowercase=False,
+        strip_accents=False
+    )
+
+    tgt_embs, tgt_bias = tgt_src_matching(prob,
+                                        src_embs,
+                                        src_bias,
+                                        src_tokenizer,
+                                        tgt_tokenizer)
+
+    # because of the init scheme in guess, this is required
+    tgt_embs, tgt_bias = nn.Parameter(tgt_embs), nn.Parameter(tgt_bias)
+
+    # checksum for debugging purpose
+    print(' checksum src | embeddings {:.5f} - bias {:.5f}'.format(
+        src_embs.norm().item(), src_bias.norm().item()))
+    tgt_model.bert.embeddings.word_embeddings.weight = tgt_embs
+    tgt_model.cls.predictions.bias = tgt_bias
+    tgt_model.cls.predictions.decoder.weight = tgt_model.bert.embeddings.word_embeddings.weight
+    print(' checksum tgt | embeddings {:.5f} - bias {:.5f}'.format(
+        tgt_model.bert.embeddings.word_embeddings.weight.norm().item(),
+        tgt_model.cls.predictions.bias.norm().item()))
+
+    return tgt_model, len(prob.keys())
+
+
 
 
 if __name__ == '__main__':
-    init_tgt(params)
+
+    print("Executing my version of the functions")
+    # tgt_model = AutoModelForMaskedLM.from_pretrained("dbmdz/bert-base-german-cased")
+    tgt_model = AutoModelForMaskedLM.from_pretrained("bert-base-cased")
+    german_model, match_count = german_english_rcsls_align(tgt_model)
+
+    # print("Executing the original version of the functions")
+    # orig_model = init_tgt(params)
+
+    breakpoint()

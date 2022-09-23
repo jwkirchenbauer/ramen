@@ -3,7 +3,7 @@
 import argparse
 import torch
 from collections import defaultdict
-from transformers import BertTokenizer
+from transformers import AutoTokenizer
 import numpy as np
 from sparsemax import Sparsemax
 import io
@@ -16,10 +16,18 @@ parser.add_argument('--src_aligned_vec', default='wiki.en.align.vec',
                     help="source embeddings in aligned space.")
 parser.add_argument('--tgt_aligned_vec', default='',
                     help="source embeddings in aligned space.")
-parser.add_argument('--src_vocab', default='',
-                    help='path to src vocabulary')
-parser.add_argument('--tgt_vocab', default='',
-                    help="target vocabulary file.")
+parser.add_argument('--src_tokenizer', default='',
+                    help='name or path of src hf tokenizer')
+parser.add_argument('--tgt_tokenizer', default='',
+                    help='name or path of tgt hf tokenizer')
+# parser.add_argument('--src_vocab', default='',
+#                     help='path to src vocabulary')
+# parser.add_argument('--src_merge', default='',
+#                     help='path to src vocabulary merge file')
+# parser.add_argument('--tgt_vocab', default='',
+#                     help="target vocabulary file.")
+# parser.add_argument('--tgt_merge', default='',
+#                     help='path to tgt vocabulary merge file')
 parser.add_argument('--topn', type=int, default=100000,
                     help="max number of words in the vocab")
 parser.add_argument('--save', default='', help='path to save file')
@@ -49,18 +57,29 @@ def get_subword_embeddings(tokenizer, fname, nmax):
     rank =  torch.arange(1, nmax+1).float()
     invf = 1.0 / rank  # invert rank to approximate power-law distribution
 
+    token_to_id = tokenizer.get_vocab()
+    unk_token_id = tokenizer(f"{tokenizer.unk_token}")["input_ids"][1]
+
     sub2wids = defaultdict(list)
     ntot = len(word2id)
     nuns = 0
     for w, i in word2id.items():
-        tokens = tokenizer.tokenize(f' {w}')  # add space to handle Roberta tokenizer
+        tokens = tokenizer.tokenize(f' {w}')  # add space to handle Roberta tokenizer # should be good here?
+        token_ids = tokenizer(f' {w}')["input_ids"][1:-1]
         if len(tokens) == 1: nuns += 1
-        for t in tokens:
-            if t != tokenizer.unk_token:
+        for t,t_id in zip(tokens,token_ids):
+            if t != tokenizer.unk_token and t_id != unk_token_id:
                 sub2wids[t].append(i)
+                try:
+                    token_to_id[t]
+                except:
+                    breakpoint()
 
     # report
     print(f'| {ntot} words - {nuns} unsegmented words')
+    print(f'| Using {len(sub2wids.items())} unique subwords to represent all words in the vec file (fasttext) word list')
+    print(f"| out of {tokenizer.vocab_size} total in the real tokenizer vocabulary")        
+
 
     # compute sub-word embeddings
     sub_embs = []
@@ -82,8 +101,16 @@ def renorm(x, dim):
 def main():
     params = parser.parse_args()
     print(params)
-    src_tokenizer = BertTokenizer(params.src_vocab, do_lower_case=False)
-    tgt_tokenizer = BertTokenizer(params.tgt_vocab, do_lower_case=False)
+
+    try:
+        # requires a valid hf name
+        src_tokenizer = AutoTokenizer.from_pretrained(params.src_tokenizer)
+    except Exception as e:
+        raise e(f"Make sure to pass a valid name or path for a hf tokenizer.")
+    try:
+        tgt_tokenizer = AutoTokenizer.from_pretrained(params.tgt_tokenizer)
+    except Exception as e:
+        raise e(f"Make sure to pass a valid name or path for a hf tokenizer.")
 
     src_embs, src_subwords = get_subword_embeddings(src_tokenizer, params.src_aligned_vec, params.topn)
     tgt_embs, tgt_subwords = get_subword_embeddings(tgt_tokenizer, params.tgt_aligned_vec, params.topn)
